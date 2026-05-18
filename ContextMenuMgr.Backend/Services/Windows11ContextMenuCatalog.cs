@@ -5,6 +5,7 @@ using System.Xml;
 using System.Xml.Linq;
 using ContextMenuMgr.Contracts;
 using Microsoft.Win32;
+using Windows.Management.Deployment;
 
 namespace ContextMenuMgr.Backend.Services;
 
@@ -168,6 +169,72 @@ internal sealed class Windows11ContextMenuCatalog
 
     private static Windows11PackageInfo? TryGetPackageInfo(string packageFullName)
     {
+        return TryGetPackageInfoFromPackageManager(packageFullName)
+            ?? TryGetPackageInfoFromRegistry(packageFullName);
+    }
+
+    private static Windows11PackageInfo? TryGetPackageInfoFromPackageManager(string packageFullName)
+    {
+        try
+        {
+            var packageManager = new PackageManager();
+            var package = TryFindPackageForUser(packageManager, packageFullName)
+                ?? TryFindPackage(packageManager, packageFullName);
+            if (package is null || string.IsNullOrWhiteSpace(package.InstalledLocation?.Path))
+            {
+                return null;
+            }
+
+            var packageVersion = package.Id.Version;
+            return new Windows11PackageInfo(
+                FamilyName: package.Id.FamilyName,
+                FullName: package.Id.FullName,
+                DisplayName: package.DisplayName,
+                PublisherDisplayName: package.PublisherDisplayName,
+                LogoPath: package.Logo?.LocalPath ?? string.Empty,
+                InstallPath: package.InstalledLocation.Path,
+                Version: new Version(
+                    packageVersion.Major,
+                    packageVersion.Minor,
+                    packageVersion.Build,
+                    packageVersion.Revision));
+        }
+        catch
+        {
+            return null;
+        }
+    }
+
+    private static Windows.ApplicationModel.Package? TryFindPackageForUser(
+        PackageManager packageManager,
+        string packageFullName)
+    {
+        try
+        {
+            return packageManager.FindPackageForUser(string.Empty, packageFullName);
+        }
+        catch
+        {
+            return null;
+        }
+    }
+
+    private static Windows.ApplicationModel.Package? TryFindPackage(
+        PackageManager packageManager,
+        string packageFullName)
+    {
+        try
+        {
+            return packageManager.FindPackage(packageFullName);
+        }
+        catch
+        {
+            return null;
+        }
+    }
+
+    private static Windows11PackageInfo? TryGetPackageInfoFromRegistry(string packageFullName)
+    {
         using var packageInfoKey = Registry.ClassesRoot.OpenSubKey($@"{PackageRepositoryPath}\{packageFullName}", writable: false);
         var installPath = packageInfoKey?.GetValue("Path")?.ToString();
         if (string.IsNullOrWhiteSpace(installPath) || !Directory.Exists(installPath))
@@ -180,6 +247,7 @@ internal sealed class Windows11ContextMenuCatalog
             FullName: packageFullName,
             DisplayName: packageFullName,
             PublisherDisplayName: packageFullName,
+            LogoPath: string.Empty,
             InstallPath: installPath,
             Version: Version.TryParse(packageInfoKey?.GetValue("Version")?.ToString(), out var version)
                 ? version
@@ -336,7 +404,7 @@ internal sealed class Windows11ContextMenuCatalog
             SourceRootPath = ContextMenuRegistryCatalog.Windows11MonitoredRootPath,
             CommandText = null,
             HandlerClsid = normalizedClsid,
-            IconPath = null,
+            IconPath = string.IsNullOrWhiteSpace(definition.Package.LogoPath) ? null : definition.Package.LogoPath,
             IconIndex = 0,
             FilePath = File.Exists(definition.ComServer.Path ?? string.Empty)
                 ? definition.ComServer.Path
@@ -620,6 +688,7 @@ internal sealed class Windows11ContextMenuCatalog
         string FullName,
         string DisplayName,
         string PublisherDisplayName,
+        string LogoPath,
         string InstallPath,
         Version Version);
 

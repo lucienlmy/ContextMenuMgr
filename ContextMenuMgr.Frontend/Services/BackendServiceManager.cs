@@ -318,7 +318,7 @@ public sealed class BackendServiceManager : IBackendServiceManager
 #else
                 "Release",
 #endif
-                "net10.0-windows",
+                "net10.0-windows10.0.17763.0",
                 "ContextMenuManagerPlus.Service.exe"))
         };
 

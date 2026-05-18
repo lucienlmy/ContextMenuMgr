@@ -200,7 +200,8 @@ public sealed class Windows11ContextMenuService
                 installPath)
             {
                 FamilyName = packageFullName.Split('_')[0],
-                PublisherDisplayName = packageFullName
+                PublisherDisplayName = packageFullName,
+                LogoPath = string.IsNullOrWhiteSpace(entry.IconPath) ? string.Empty : entry.IconPath
             },
             [],
             new Windows11ComServerInfo(entry.HandlerClsid, entry.FilePath, entry.DisplayName),

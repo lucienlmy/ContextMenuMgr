@@ -31,7 +31,7 @@ public partial class Windows11ContextMenuItemViewModel : ObservableObject, IDisp
         _service = service;
         _localization = localization;
 
-        _logoTask = Windows11ContextMenuService.LoadLogo(_primaryDefinition.Package, CancellationToken.None);
+        _ = LoadLogoAsync();
         IsEnabled = definitions.All(static definition => definition.IsEnabled);
 
         _languageChangedHandler = (_, _) =>
@@ -43,8 +43,6 @@ public partial class Windows11ContextMenuItemViewModel : ObservableObject, IDisp
         };
         _localization.LanguageChanged += _languageChangedHandler;
     }
-
-    private readonly Task<ImageSource?> _logoTask;
 
     /// <summary>
     /// Gets the grouped source definitions.
@@ -72,8 +70,6 @@ public partial class Windows11ContextMenuItemViewModel : ObservableObject, IDisp
     public bool HasComServerPath => !string.IsNullOrWhiteSpace(_primaryDefinition.ComServer.Path);
 
     public bool HasPublisherName => !string.IsNullOrWhiteSpace(_primaryDefinition.Package.PublisherDisplayName);
-
-    public ImageSource? LogoSource => _logoTask.IsCompletedSuccessfully ? _logoTask.Result : null;
 
     public bool HasLogo => LogoSource is not null;
 
@@ -108,6 +104,13 @@ public partial class Windows11ContextMenuItemViewModel : ObservableObject, IDisp
     /// </summary>
     [ObservableProperty]
     public partial bool IsPendingApproval { get; set; }
+
+    /// <summary>
+    /// Gets or sets the logo image source.
+    /// </summary>
+    [ObservableProperty]
+    [NotifyPropertyChangedFor(nameof(HasLogo))]
+    public partial ImageSource? LogoSource { get; set; }
 
     public bool IsMachineBlocked => Definitions.Any(static definition => definition.IsMachineBlocked);
 
@@ -180,6 +183,18 @@ public partial class Windows11ContextMenuItemViewModel : ObservableObject, IDisp
         finally
         {
             IsBusy = false;
+        }
+    }
+
+    private async Task LoadLogoAsync()
+    {
+        try
+        {
+            LogoSource = await Windows11ContextMenuService.LoadLogo(_primaryDefinition.Package, CancellationToken.None);
+        }
+        catch
+        {
+            LogoSource = null;
         }
     }
 
