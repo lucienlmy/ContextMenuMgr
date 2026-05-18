@@ -61,7 +61,7 @@ internal sealed class Windows11ContextMenuCatalog
                 try
                 {
                     ct.ThrowIfCancellationRequested();
-                    var package = TryGetPackageInfo(fullName);
+                    var package = TryGetPackageInfo(fullName, userContext);
                     if (package is null)
                     {
                         return;
@@ -167,18 +167,20 @@ internal sealed class Windows11ContextMenuCatalog
         return subKey?.GetSubKeyNames() ?? [];
     }
 
-    private static Windows11PackageInfo? TryGetPackageInfo(string packageFullName)
+    private static Windows11PackageInfo? TryGetPackageInfo(string packageFullName, BackendUserContext? userContext)
     {
-        return TryGetPackageInfoFromPackageManager(packageFullName)
-            ?? TryGetPackageInfoFromRegistry(packageFullName);
+        return TryGetPackageInfoFromPackageManager(packageFullName, userContext)
+            ?? TryGetPackageInfoFromRegistry(packageFullName, userContext);
     }
 
-    private static Windows11PackageInfo? TryGetPackageInfoFromPackageManager(string packageFullName)
+    private static Windows11PackageInfo? TryGetPackageInfoFromPackageManager(
+        string packageFullName,
+        BackendUserContext? userContext)
     {
         try
         {
             var packageManager = new PackageManager();
-            var package = TryFindPackageForUser(packageManager, packageFullName)
+            var package = TryFindPackageForUser(packageManager, userContext?.Sid, packageFullName)
                 ?? TryFindPackage(packageManager, packageFullName);
             if (package is null || string.IsNullOrWhiteSpace(package.InstalledLocation?.Path))
             {
@@ -186,13 +188,14 @@ internal sealed class Windows11ContextMenuCatalog
             }
 
             var packageVersion = package.Id.Version;
+            var installPath = package.InstalledLocation.Path;
             return new Windows11PackageInfo(
                 FamilyName: package.Id.FamilyName,
                 FullName: package.Id.FullName,
                 DisplayName: package.DisplayName,
                 PublisherDisplayName: package.PublisherDisplayName,
-                LogoPath: package.Logo?.LocalPath ?? string.Empty,
-                InstallPath: package.InstalledLocation.Path,
+                LogoPath: ResolvePackageLogoPath(installPath, package.Logo?.LocalPath, userContext),
+                InstallPath: installPath,
                 Version: new Version(
                     packageVersion.Major,
                     packageVersion.Minor,
@@ -207,11 +210,17 @@ internal sealed class Windows11ContextMenuCatalog
 
     private static Windows.ApplicationModel.Package? TryFindPackageForUser(
         PackageManager packageManager,
+        string? userSid,
         string packageFullName)
     {
+        if (string.IsNullOrWhiteSpace(userSid))
+        {
+            return null;
+        }
+
         try
         {
-            return packageManager.FindPackageForUser(string.Empty, packageFullName);
+            return packageManager.FindPackageForUser(userSid, packageFullName);
         }
         catch
         {
@@ -233,7 +242,9 @@ internal sealed class Windows11ContextMenuCatalog
         }
     }
 
-    private static Windows11PackageInfo? TryGetPackageInfoFromRegistry(string packageFullName)
+    private static Windows11PackageInfo? TryGetPackageInfoFromRegistry(
+        string packageFullName,
+        BackendUserContext? userContext)
     {
         using var packageInfoKey = Registry.ClassesRoot.OpenSubKey($@"{PackageRepositoryPath}\{packageFullName}", writable: false);
         var installPath = packageInfoKey?.GetValue("Path")?.ToString();
@@ -247,22 +258,275 @@ internal sealed class Windows11ContextMenuCatalog
             FullName: packageFullName,
             DisplayName: packageFullName,
             PublisherDisplayName: packageFullName,
-            LogoPath: string.Empty,
+            LogoPath: ResolvePackageLogoPath(installPath, null, userContext),
             InstallPath: installPath,
             Version: Version.TryParse(packageInfoKey?.GetValue("Version")?.ToString(), out var version)
                 ? version
                 : new Version(0, 0));
     }
 
+    private static string ResolvePackageLogoPath(
+        string installPath,
+        string? packageLogoPath,
+        BackendUserContext? userContext)
+    {
+        var assetRoots = GetPackageAssetRoots(installPath, userContext).ToArray();
+        var packageLogo = TryResolveExistingAssetPath(installPath, packageLogoPath, assetRoots);
+        if (!string.IsNullOrWhiteSpace(packageLogo))
+        {
+            return packageLogo;
+        }
+
+        foreach (var manifestLogoPath in GetManifestLogoPaths(installPath))
+        {
+            var resolved = TryResolveExistingAssetPath(installPath, manifestLogoPath, assetRoots);
+            if (!string.IsNullOrWhiteSpace(resolved))
+            {
+                return resolved;
+            }
+        }
+
+        return string.Empty;
+    }
+
+    private static IEnumerable<string> GetPackageAssetRoots(string installPath, BackendUserContext? userContext)
+    {
+        yield return installPath;
+
+        foreach (var executableName in GetManifestExecutableNames(installPath))
+        {
+            foreach (var appPathRoot in GetAppPathRoots(executableName, userContext))
+            {
+                yield return appPathRoot;
+            }
+        }
+    }
+
+    private static IEnumerable<string> GetManifestExecutableNames(string installPath)
+    {
+        var manifestPath = GetManifestPath(installPath);
+        if (string.IsNullOrWhiteSpace(manifestPath))
+        {
+            yield break;
+        }
+
+        XDocument document;
+        try
+        {
+            document = XDocument.Load(manifestPath, LoadOptions.None);
+        }
+        catch
+        {
+            yield break;
+        }
+
+        foreach (var element in document.Descendants())
+        {
+            var executable = element.Attributes().FirstOrDefault(static attribute => attribute.Name.LocalName == "Executable")?.Value;
+            if (string.IsNullOrWhiteSpace(executable))
+            {
+                continue;
+            }
+
+            var fileName = Path.GetFileName(executable);
+            if (!string.IsNullOrWhiteSpace(fileName))
+            {
+                yield return fileName;
+            }
+        }
+    }
+
+    private static IEnumerable<string> GetAppPathRoots(string executableName, BackendUserContext? userContext)
+    {
+        foreach (var root in ReadAppPathRoots(Registry.LocalMachine, executableName))
+        {
+            yield return root;
+        }
+
+        if (string.IsNullOrWhiteSpace(userContext?.Sid))
+        {
+            yield break;
+        }
+
+        using var userRoot = Registry.Users.OpenSubKey($@"{userContext.Sid}\Software\Microsoft\Windows\CurrentVersion\App Paths", writable: false);
+        foreach (var root in ReadAppPathRoots(userRoot, executableName))
+        {
+            yield return root;
+        }
+    }
+
+    private static IEnumerable<string> ReadAppPathRoots(RegistryKey? appPathsRoot, string executableName)
+    {
+        if (appPathsRoot is null)
+        {
+            yield break;
+        }
+
+        using var appPathKey = appPathsRoot.OpenSubKey(executableName, writable: false);
+        if (appPathKey is null)
+        {
+            yield break;
+        }
+
+        foreach (var value in new[] { appPathKey.GetValue(null)?.ToString(), appPathKey.GetValue("Path")?.ToString() })
+        {
+            if (string.IsNullOrWhiteSpace(value))
+            {
+                continue;
+            }
+
+            var directory = File.Exists(value)
+                ? Path.GetDirectoryName(value)
+                : value;
+            if (!string.IsNullOrWhiteSpace(directory) && Directory.Exists(directory))
+            {
+                yield return directory;
+            }
+        }
+    }
+
+    private static IEnumerable<string> GetManifestLogoPaths(string installPath)
+    {
+        var manifestPath = GetManifestPath(installPath);
+        if (string.IsNullOrWhiteSpace(manifestPath))
+        {
+            yield break;
+        }
+
+        XDocument document;
+        try
+        {
+            document = XDocument.Load(manifestPath, LoadOptions.None);
+        }
+        catch
+        {
+            yield break;
+        }
+
+        foreach (var visualElements in document.Descendants().Where(static element => element.Name.LocalName == "VisualElements"))
+        {
+            foreach (var attributeName in new[] { "Square44x44Logo", "Square150x150Logo", "Logo" })
+            {
+                var value = visualElements.Attribute(attributeName)?.Value;
+                if (!string.IsNullOrWhiteSpace(value))
+                {
+                    yield return value;
+                }
+            }
+        }
+
+        foreach (var logo in document.Descendants().Where(static element => element.Name.LocalName == "Logo"))
+        {
+            var value = logo.Value;
+            if (!string.IsNullOrWhiteSpace(value))
+            {
+                yield return value;
+            }
+        }
+    }
+
+    private static string? TryResolveExistingAssetPath(
+        string installPath,
+        string? assetPath,
+        IReadOnlyList<string> searchRoots)
+    {
+        if (string.IsNullOrWhiteSpace(assetPath)
+            || assetPath.StartsWith("ms-resource:", StringComparison.OrdinalIgnoreCase)
+            || assetPath.Contains("://", StringComparison.OrdinalIgnoreCase))
+        {
+            return null;
+        }
+
+        var normalizedAssetPath = assetPath.Replace('/', Path.DirectorySeparatorChar);
+        var candidates = Path.IsPathRooted(normalizedAssetPath)
+            ? [normalizedAssetPath]
+            : EnumerateRootedAssetCandidates(installPath, normalizedAssetPath, searchRoots).ToArray();
+
+        foreach (var candidate in candidates)
+        {
+            foreach (var path in EnumerateAssetPathCandidates(candidate))
+            {
+                try
+                {
+                    if (File.Exists(path))
+                    {
+                        return path;
+                    }
+                }
+                catch
+                {
+                }
+            }
+        }
+
+        return null;
+    }
+
+    private static IEnumerable<string> EnumerateRootedAssetCandidates(
+        string installPath,
+        string assetPath,
+        IReadOnlyList<string> searchRoots)
+    {
+        yield return Path.Combine(installPath, assetPath);
+
+        foreach (var root in searchRoots.Where(static root => !string.IsNullOrWhiteSpace(root)).Distinct(StringComparer.OrdinalIgnoreCase))
+        {
+            yield return Path.Combine(root, assetPath);
+
+            IEnumerable<string> childDirectories;
+            try
+            {
+                childDirectories = Directory.EnumerateDirectories(root).Take(32).ToArray();
+            }
+            catch
+            {
+                continue;
+            }
+
+            foreach (var childDirectory in childDirectories)
+            {
+                yield return Path.Combine(childDirectory, assetPath);
+            }
+        }
+    }
+
+    private static IEnumerable<string> EnumerateAssetPathCandidates(string path)
+    {
+        yield return path;
+
+        var directory = Path.GetDirectoryName(path);
+        var extension = Path.GetExtension(path);
+        var fileName = Path.GetFileNameWithoutExtension(path);
+        if (string.IsNullOrWhiteSpace(directory)
+            || string.IsNullOrWhiteSpace(extension)
+            || string.IsNullOrWhiteSpace(fileName))
+        {
+            yield break;
+        }
+
+        foreach (var qualifier in new[]
+        {
+            ".scale-100",
+            ".scale-125",
+            ".scale-150",
+            ".scale-200",
+            ".targetsize-16",
+            ".targetsize-24",
+            ".targetsize-32",
+            ".targetsize-48",
+            ".targetsize-256"
+        })
+        {
+            yield return Path.Combine(directory, $"{fileName}{qualifier}{extension}");
+        }
+    }
+
     private static async Task<IReadOnlyList<Windows11ContextMenuItemDefinition>> AnalyzeManifestAsync(
         Windows11PackageInfo package,
         CancellationToken cancellationToken)
     {
-        var manifestPath = File.Exists(Path.Combine(package.InstallPath, "AppxManifest.xml"))
-            ? Path.Combine(package.InstallPath, "AppxManifest.xml")
-            : Path.Combine(package.InstallPath, @"AppxMetadata\AppxBundleManifest.xml");
-
-        if (!File.Exists(manifestPath))
+        var manifestPath = GetManifestPath(package.InstallPath);
+        if (string.IsNullOrWhiteSpace(manifestPath))
         {
             return [];
         }
@@ -375,6 +639,18 @@ internal sealed class Windows11ContextMenuCatalog
                     contextTypes);
             })
             .ToArray();
+    }
+
+    private static string? GetManifestPath(string installPath)
+    {
+        var appManifestPath = Path.Combine(installPath, "AppxManifest.xml");
+        if (File.Exists(appManifestPath))
+        {
+            return appManifestPath;
+        }
+
+        var bundleManifestPath = Path.Combine(installPath, @"AppxMetadata\AppxBundleManifest.xml");
+        return File.Exists(bundleManifestPath) ? bundleManifestPath : null;
     }
 
     private static ContextMenuEntry CreateEntry(
